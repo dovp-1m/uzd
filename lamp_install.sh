@@ -1,80 +1,96 @@
 sudo apt-get update
-sudo apt-get install -y curl make git tar cmake wget build-essential unzip
 
-mkdir -p /opt/src /opt/nginx /opt/mariadb /opt/php
+sudo apt-get install -y build-essential pkg-config autoconf libtool bison re2c sqlite
+sudo apt-get install -y libsqlite3-dev libpcre3-dev libssl-dev zlib1g-dev
+sudo apt-get build-dep -y mariadb-server
 
-cd /opt/src
-wget https://nginx.org/download/nginx-1.26.3.tar.gz
-tar -zxvf nginx-1.26.3.tar.gz
-cd nginx-1.26.3
-./configure --prefix=/opt/nginx -with-http_ssl_module --with-http_v2_module --with-http_realip_module --with-http_addition_module --with-http_sub_module --with-http_dav_module --with-http_flv_module --with-http_mp4_module --with-http_gunzip_module --with-http_gzip_static_module --with-http_random_index_module --with-http_secure_link_module --with-http_stub_status_module --with-http_auth_request_module --with-threads --with-stream --with-stream_ssl_module --with-mail --with-mail_ssl_module
-make
-sudo make install
-
-/opt/nginx/sbin/nginx
+sudo mkdir /opt/src /opt/nginx /opt/mariadb /opt/php
 
 cd /opt/src
 wget https://mariadb.mirror.serveriai.lt//mariadb-11.7.2/source/mariadb-11.7.2.tar.gz
-tar -zxvf mariadb-11.7.2.tar.gz
+tar -zxf mariadb-11.7.2.tar.gz
 cd mariadb-11.7.2
-cmake . -DCMAKE_INSTALL_PREFIX=/opt/mariadb -DMYSQL_DATADIR=/opt/mariadb/data -DINSTALL_SYSCONFDIR=/etc/mysql -DDEFAULT_CHARSET=utf8mb4 -DDEFAULT_COLLATION=utf8mb4_unicode_ci
-make
-sudo make install
+mkdir build
+cd build
+cmake .. -DCMAKE_INSTALL_PREFIX=/opt/mariadb
+cmake --build .
+cmake --install .
 
-sudo mkdir -p /opt/mariadb/data
-sudo chown -R mysql:mysql /opt/mariadb/data
-sudo /opt/mariadb/scripts/mysql_install_db --user=mysql --basedir=/opt/mariadb --datadir=/opt/mariadb/data
+groupadd mysql
+useradd -r -g mysql -s /bin/false mysql
+mkdir /opt/mariadb/data
+chown mysql:mysql /opt/mariadb/data
 
-sudo /opt/mariadb/bin/mysql_secure_installation <<EOF
-n
-Unix2025
-Unix2025
-y
-y
-y
-y
+mkdir -p /etc/my.cnf.d
+
+cat > /etc/my.cnf <<EOF
+[mysqld]
+datadir = /opt/mariadb/data
+socket = /tmp/mysql.sock
+user = mysql
 EOF
+chown mysql:mysql /etc/my.cnf
+chmod 644 /etc/my.cnf
 
-sudo /opt/mariadb/bin/mysql -u root -pUnix2025 -e "CREATE USER 'dbadmin'@'10.1.0.73' IDENTIFIED BY 'Unix2025'; GRANT ALL PRIVILEGES ON *.* TO 'dbadmin'@'10.1.0.73' WITH GRANT OPTION; FLUSH PRIVILEGES;"
+/opt/mariadb/scripts/mariadb-upgrade --user=mysql --datadir=/opt/mariadb/data
+/opt/mariadb/bin/mariadbd-safe --user=mysql --datadir=/opt/mariadb/data &
+
+echo "CREATE USER 'dbadmin'@'10.1.0.73' IDENTIFIED BY 'Unix2025';" | /opt/mariadb/bin/mariadb -u root
+echo "GRANT ALL PRIVILEGES ON *.* TO 'dbadmin'@'10.1.0.73' WITH GRANT OPTION;" | /opt/mariadb/bin/mariadb -u root
+echo "FLUSH PRIVILEGES;" | /opt/mariadb/bin/mariadb -u root
 
 cd /opt/src
 wget https://www.php.net/distributions/php-8.4.6.tar.gz
-tar -zxvf php-8.4.6.tar.gz
+tar -zxf php-8.4.6.tar.gz
 cd php-8.4.6
-./configure --prefix=/opt/php --with-config-file-path=/opt/php/etc --with-fpm-user=www-data --with-fpm-group=www-data --enable-fpm --with-mysqli --with-pdo-mysql --with-iconv --with-zlib --with-curl --with-jpeg-dir --with-png-dir --with-freetype-dir --with-readline --with-libxml-dir --with-xsl --with-gd --with-mhash --with-openssl --enable-mbstring --enable-intl --enable-opcache
+./configure --prefix=/opt/php --enable-fpm --with-pdo-mysql=/opt/mariadb
 make
-sudo make install
+make install
 
-cp php.ini-production /opt/php/etc/php.ini
 cp /opt/php/etc/php-fpm.conf.default /opt/php/etc/php-fpm.conf
-cp /opt/php/etc/php-fpm.d/www.conf.default /opt/php/etc/php-fpm.d/www.conf
+sed -i 's/^;listen = .*/listen = \/run\/php-fpm.sock/' /opt/php/etc/php-fpm.conf
+sed -i 's/^user = .*/user = www-data/' /opt/php/etc/php-fpm.conf
+sed -i 's/^group = .*/group = www-data/' /opt/php/etc/php-fpm.conf
 
-sudo /opt/php/sbin/php-fpm --nodaemonize
+/opt/php/sbin/php-fpm &
 
-sudo tee /etc/nginx/sites-available/default <<EOF
+cd /opt/src
+wget https://nginx.org/download/nginx-1.28.0.tar.gz
+tar -zxf nginx-1.28.0.tar.gz
+cd nginx-1.28.0
+./configure --prefix=/opt/nginx --with-http_ssl_module
+make
+make install
+
+sed -i 's/^user .*/user www-data;/' /opt/nginx/conf/nginx.conf
+mkdir -p /opt/nginx/conf.d
+cat > /opt/nginx/conf.d/default.conf <<EOF
 server {
     listen 80;
     server_name localhost;
-
     root /var/www/html;
-    index index.php index.html index.htm;
-
+    index index.php index.html;
     location / {
         try_files \$uri \$uri/ =404;
     }
-
     location ~ \.php$ {
-        include snippets/fastcgi-php.conf;
-        fastcgi_pass unix:/var/run/php/php8.1-fpm.sock;
+        fastcgi_pass unix:/run/php-fpm.sock;
+        fastcgi_index index.php;
+        fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
+        include fastcgi_params;
     }
 }
 EOF
 
-sudo ln -s /etc/nginx/sites-available/default /etc/nginx/sites-enabled/
-sudo systemctl restart nginx
+if ! id -u www-data > /dev/null 2>&1; then
+    groupadd www-data
+    useradd -r -g www-data -s /bin/false www-data
+fi
 
-echo "<?php phpinfo(); ?>" | sudo tee /var/www/html/info.php
+mkdir -p /var/www/html
+chown www-data:www-data /var/www/html
+echo "<?php phpinfo(); ?>" > /var/www/html/info.php
+chown www-data:www-data /var/www/html/info.php
 
-curl http://localhost/info.php
-
-
+/opt/php/sbin/php-fpm &
+/opt/nginx/sbin/nginx &
